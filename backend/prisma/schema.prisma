@@ -1,0 +1,316 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DISABLED
+}
+
+enum KeyStatus {
+  ACTIVE
+  REVOKED
+}
+
+enum OrderStatus {
+  PENDING
+  VERIFIED
+  FAILED
+  EXPIRED
+}
+
+enum TxStatus {
+  PENDING
+  VERIFIED
+  FAILED
+  EXPIRED
+  DUPLICATE
+}
+
+enum LedgerType {
+  CREDIT
+  DEBIT
+  RESERVE
+  RELEASE
+}
+
+enum WithdrawalStatus {
+  PENDING
+  PROCESSING
+  PAID
+  REJECTED
+  CANCELLED
+}
+
+// All money is stored as BIGINT paise (INR * 100). Never floats.
+
+model User {
+  id            String     @id @default(uuid())
+  name          String
+  email         String     @unique
+  passwordHash  String
+  phone         String?
+  role          Role       @default(USER)
+  status        UserStatus @default(ACTIVE)
+  emailVerified Boolean    @default(false)
+  failedLogins  Int        @default(0)
+  lockedUntil   DateTime?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  lastLoginAt   DateTime?
+
+  profile        MerchantProfile?
+  wallet         Wallet?
+  apiKeys        ApiKey[]
+  orders         PaymentOrder[]
+  transactions   Transaction[]
+  ledger         LedgerEntry[]
+  withdrawals    Withdrawal[]
+  sessions       Session[]
+  resets         PasswordReset[]
+  otps           EmailOtp[]
+  apiLogs        ApiRequestLog[]
+  securityEvents SecurityEvent[]
+  adminActions   AdminActionLog[] @relation("AdminActions")
+  adminTargets   AdminActionLog[] @relation("AdminTargets")
+  idempotency    IdempotencyKey[]
+
+  @@index([role, status])
+  @@index([emailVerified, createdAt])
+}
+
+model MerchantProfile {
+  id           String   @id @default(uuid())
+  userId       String   @unique
+  businessName String
+  upiId        String?
+  upiVerified  Boolean  @default(false)
+  upiUpdatedAt DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// Authoritative balance row. Mutated only via atomic conditional updates inside DB transactions.
+model Wallet {
+  userId         String   @id
+  available      BigInt   @default(0)
+  reserved       BigInt   @default(0)
+  totalReceived  BigInt   @default(0)
+  totalWithdrawn BigInt   @default(0)
+  updatedAt      DateTime @updatedAt
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model ApiKey {
+  id         String    @id @default(uuid())
+  userId     String
+  name       String
+  keyPrefix  String
+  keyHash    String    @unique
+  status     KeyStatus @default(ACTIVE)
+  lastUsedAt DateTime?
+  createdAt  DateTime  @default(now())
+  revokedAt  DateTime?
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  logs       ApiRequestLog[]
+
+  @@index([userId])
+}
+
+model PaymentOrder {
+  id               String      @id @default(uuid())
+  userId           String
+  orderId          String // merchant-supplied reference
+  upstreamOrderId  String      @unique // globally unique id sent upstream (prevents cross-merchant collisions)
+  amount           BigInt
+  currency         String      @default("INR")
+  status           OrderStatus @default(PENDING)
+  paymentUrl       String?
+  upstreamResponse Json?
+  createdAt        DateTime    @default(now())
+  expiresAt        DateTime
+  verifiedAt       DateTime?
+  user             User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transaction      Transaction?
+
+  @@unique([userId, orderId])
+  @@index([userId, createdAt])
+  @@index([status, expiresAt])
+  @@index([userId, status])
+}
+
+model Transaction {
+  id                    String       @id @default(uuid())
+  userId                String
+  paymentOrderId        String       @unique
+  externalTransactionId String?      @unique
+  amount                BigInt
+  currency              String       @default("INR")
+  status                TxStatus
+  upstreamStatus        String?
+  metadata              Json?
+  verifiedAt            DateTime?
+  createdAt             DateTime     @default(now())
+  user                  User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  order                 PaymentOrder @relation(fields: [paymentOrderId], references: [id], onDelete: Cascade)
+  ledger                LedgerEntry[]
+
+  @@unique([userId, paymentOrderId])
+  @@index([userId, createdAt])
+}
+
+model LedgerEntry {
+  id            String      @id @default(uuid())
+  userId        String
+  transactionId String?
+  withdrawalId  String?
+  type          LedgerType
+  amount        BigInt // always positive; `type` defines direction
+  balanceAfter  BigInt // available balance after this entry
+  description   String
+  createdAt     DateTime    @default(now())
+  user          User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transaction   Transaction? @relation(fields: [transactionId], references: [id])
+  withdrawal    Withdrawal?  @relation(fields: [withdrawalId], references: [id])
+
+  // DB-level guarantee: one CREDIT per transaction; one RESERVE / DEBIT / RELEASE per withdrawal.
+  @@unique([transactionId, type])
+  @@unique([withdrawalId, type])
+  @@index([userId, createdAt])
+}
+
+model Withdrawal {
+  id            String           @id @default(uuid())
+  userId        String
+  amount        BigInt
+  upiIdSnapshot String
+  status        WithdrawalStatus @default(PENDING)
+  adminNote     String?
+  adminId       String?
+  requestedAt   DateTime         @default(now())
+  processedAt   DateTime?
+  paidAt        DateTime?
+  rejectedAt    DateTime?
+  cancelledAt   DateTime?
+  user          User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ledger        LedgerEntry[]
+
+  @@index([userId, requestedAt])
+  @@index([status, requestedAt])
+}
+
+model ApiRequestLog {
+  id           String   @id @default(uuid())
+  userId       String?
+  apiKeyId     String?
+  endpoint     String
+  method       String
+  statusCode   Int
+  responseTime Int
+  ipHash       String
+  createdAt    DateTime @default(now())
+  user         User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  apiKey       ApiKey?  @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([createdAt])
+}
+
+model AdminActionLog {
+  id           String   @id @default(uuid())
+  adminId      String
+  targetUserId String?
+  action       String
+  metadata     Json?
+  createdAt    DateTime @default(now())
+  admin        User     @relation("AdminActions", fields: [adminId], references: [id])
+  target       User?    @relation("AdminTargets", fields: [targetUserId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+}
+
+model SecurityEvent {
+  id            String   @id @default(uuid())
+  userId        String?
+  eventType     String
+  ipHash        String?
+  userAgentHash String?
+  metadata      Json?
+  createdAt     DateTime @default(now())
+  user          User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([createdAt])
+}
+
+model IdempotencyKey {
+  id          String   @id @default(uuid())
+  userId      String
+  key         String
+  endpoint    String
+  requestHash String
+  response    Json?
+  statusCode  Int?
+  createdAt   DateTime @default(now())
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, key])
+}
+
+model Session {
+  id            String   @id @default(uuid())
+  userId        String
+  tokenHash     String   @unique
+  ipHash        String?
+  userAgentHash String?
+  expiresAt     DateTime
+  createdAt     DateTime @default(now())
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model PasswordReset {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// One-time email verification codes. Only an HMAC of the code is stored.
+model EmailOtp {
+  id         String    @id @default(uuid())
+  userId     String
+  codeHash   String
+  purpose    String    @default("VERIFY_EMAIL")
+  attempts   Int       @default(0)
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([expiresAt])
+}
+
+model PlatformSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
